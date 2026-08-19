@@ -1,0 +1,61 @@
+# 태그를 밀면 Windows 러너에서 exe 를 빌드해 릴리스에 붙인다.
+# 배포할 때마다 개발자 Windows PC 를 켜지 않아도 되게 하려는 것이다.
+#   git tag v1.0.1 && git push origin v1.0.1
+# 결과물: https://github.com/<owner>/<repo>/releases/latest/download/Carmacro-win.zip
+name: build-windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:      # 태그 없이 수동 실행 — 아티팩트로만 받는다
+
+permissions:
+  contents: write         # 릴리스 생성/업로드에 필요
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 로컬 빌드와 같은 3.11 로 맞춘다. setup-python 빌드에는 tkinter 가 들어 있다.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: pip install --upgrade pyinstaller selenium
+
+      # --collect-all selenium: attach() 의 지연 임포트를 정적 분석이 못 따라간다.
+      # --windowed: tkinter 앱이라 콘솔 창이 같이 뜨면 안 된다.
+      - name: exe 빌드
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name Carmacro --collect-all selenium new_app.py
+
+      - name: 배포본 묶기
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\Carmacro-win | Out-Null
+          Copy-Item dist\Carmacro.exe, 사용법.txt dist\Carmacro-win\
+          Compress-Archive -Path dist\Carmacro-win\* -DestinationPath dist\Carmacro-win.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Carmacro-win
+          path: dist/Carmacro-win.zip
+
+      # 같은 태그로 다시 돌려도 죽지 않게 — 있으면 덮어쓰고 없으면 만든다.
+      - name: 릴리스에 붙이기
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$env:GITHUB_REF_NAME" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$env:GITHUB_REF_NAME" dist\Carmacro-win.zip `
+              --title "$env:GITHUB_REF_NAME" `
+              --notes "Windows 64bit 배포본. 압축을 풀고 Carmacro.exe 실행 → [크롬 실행] 버튼 → 로그인 → [크롬 연결 / 새로고침]."
+          } else {
+            gh release upload "$env:GITHUB_REF_NAME" dist\Carmacro-win.zip --clobber
+          }

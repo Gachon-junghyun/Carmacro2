@@ -1,8 +1,12 @@
 
 import http.client
+import os
 import queue
 import re
+import shutil
 import ssl
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -263,6 +267,87 @@ class ServerClock(threading.Thread):
         else:
             worst = -(self.hi - self.lo) / 2 + one_way - lead
         return worst
+
+
+# ── 크롬 기동 ───────────────────────────────────────────────────────────────
+# Chrome 136+ 는 기본 프로필에 디버깅 포트를 열어주지 않는다 — --user-data-dir 로
+# 전용 프로필을 강제해야 포트가 산다. 예전엔 run_chrome.sh/.bat 을 따로 들고
+# 다녔는데, exe 로 배포하면 스크립트가 따라다니지 않아 앱 안으로 들여왔다.
+
+def chrome_profile():
+    p = os.environ.get("CARMACRO_PROFILE")
+    if p:
+        return p
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Carmacro/chrome-profile")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "Carmacro", "chrome-profile")
+    return os.path.expanduser("~/.config/carmacro/chrome-profile")
+
+
+def find_chrome():
+    c = os.environ.get("CHROME_BIN")
+    if c and os.path.exists(c):
+        return c
+    if os.name == "nt":
+        bases = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                 os.environ.get("LOCALAPPDATA", "")]
+        cands = [os.path.join(b, "Google", "Chrome", "Application", "chrome.exe")
+                 for b in bases if b]
+    elif sys.platform == "darwin":
+        cands = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                 os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                 "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"]
+    else:
+        cands = []
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    for n in ("google-chrome", "chrome", "chromium", "chromium-browser"):
+        c = shutil.which(n)
+        if c:
+            return c
+    return None
+
+
+def port_version(timeout=1.0):
+    """디버깅 포트가 살아 있으면 브라우저 이름을, 아니면 None."""
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=timeout)
+        c.request("GET", "/json/version")
+        r = c.getresponse()
+        body = r.read().decode("utf-8", "replace")
+        c.close()
+        if r.status != 200:
+            return None
+        m = re.search(r'"Browser"\s*:\s*"([^"]*)"', body)
+        return m.group(1) if m else "Chrome"
+    except Exception:
+        return None
+
+
+def launch_chrome(url=LIST_URL):
+    exe = find_chrome()
+    if not exe:
+        raise RuntimeError("크롬을 찾지 못했다 — CHROME_BIN 환경변수로 경로를 지정해라")
+    prof = chrome_profile()
+    os.makedirs(prof, exist_ok=True)
+    args = [exe,
+            "--remote-debugging-port=%d" % PORT,
+            "--user-data-dir=%s" % prof,
+            "--no-first-run",
+            "--no-default-browser-check",
+            url]
+    # 앱이 죽어도 크롬은 남아야 한다 — 부모에서 떼어 띄운다.
+    kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen(args, **kw)
+    return exe, prof
 
 
 def attach():
@@ -626,6 +711,9 @@ class App(tk.Tk):
         f2.pack(fill="both", expand=True, padx=10, pady=6)
         r2 = ttk.Frame(f2)
         r2.pack(fill="x", pady=4)
+        self.btn_chrome = ttk.Button(r2, text="크롬 실행",
+                                     command=self.open_chrome)
+        self.btn_chrome.pack(side="left", padx=4)
         ttk.Button(r2, text="크롬 연결 / 새로고침",
                    command=self.refresh).pack(side="left", padx=4)
         self.v_sess = tk.StringVar(value="세션 --:--")
@@ -770,7 +858,11 @@ class App(tk.Tk):
         try:
             while True:
                 kind, msg = self.q.get_nowait()
-                self._log(msg, "grn" if kind == "clock" else None)
+                if kind == "btn":
+                    self.btn_chrome.config(state="normal")
+                    continue
+                self._log(msg, {"clock": "grn", "chrome": "grn",
+                                "err": "red"}.get(kind))
         except queue.Empty:
             pass
         self.after(200, self._pump)
@@ -1022,6 +1114,33 @@ class App(tk.Tk):
             return
         self.q.put(("p", "접수기간 %d건 읽음" % len(rows)))
         self.after(0, lambda: PeriodDialog(self, rows))
+
+    def open_chrome(self):
+        """전용 프로필 크롬을 띄우고 포트가 뜰 때까지 기다린다(작업 스레드)."""
+        self.btn_chrome.config(state="disabled")
+        threading.Thread(target=self._chrome_worker, daemon=True).start()
+
+    def _chrome_worker(self):
+        try:
+            v = port_version()
+            if v:
+                self.q.put(("chrome", "%d 포트가 이미 열려 있다 — 그대로 쓴다 (%s)" % (PORT, v)))
+                return
+            exe, prof = launch_chrome()
+            self.q.put(("f", "크롬 실행: %s" % exe))
+            self.q.put(("f", "프로필: %s" % prof))
+            for _ in range(40):
+                v = port_version()
+                if v:
+                    self.q.put(("chrome",
+                                "크롬 준비 완료 (%s) — 로그인 후 [크롬 연결 / 새로고침]" % v))
+                    return
+                time.sleep(0.25)
+            self.q.put(("err", "10초 안에 %d 포트가 열리지 않았다. 크롬 창을 확인해라" % PORT))
+        except Exception as e:
+            self.q.put(("err", "크롬 실행 실패: %s" % e))
+        finally:
+            self.q.put(("btn", ""))
 
     def refresh(self):
         try:
