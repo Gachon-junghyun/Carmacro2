@@ -1,9 +1,12 @@
 
+import http.client
 import queue
 import re
+import ssl
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -11,16 +14,46 @@ from tkinter import messagebox, ttk
 
 KST = timezone(timedelta(hours=9))
 PORT = 9222
-CLOCK_URL = "https://ev.or.kr/ev_ps/ps/seller/sellerApplyInfo"
+# 시계는 **루트**에서 잰다. Date 헤더는 같은 서버가 찍지만 응답이 훨씬 싸다.
+# 구간 폭은 곧 RTT 다(제약 하나가 1.0+RTT 초 폭) — 느린 엔드포인트로 재면
+# 아무리 많이 던져도 폭이 안 좁아진다. 접수 몰릴 때 실측:
+#   루트 /                폭 386ms · 최소RTT 256ms · 실패 0
+#   sellerApplyInfo      폭 917ms · 최소RTT 336ms · 실패 0   (TTFB 최대 10.8s 관측)
+# 게다가 정작 필요한 신청 경로에 부하를 얹지 않는 이점도 있다.
+CLOCK_URL = "https://ev.or.kr/"
 LIST_URL = "https://ev.or.kr/ev_ps/ps/seller/sellerApplyInfo"
 PERIOD_URL = "https://ev.or.kr/ev_ps/ps/main/statLocalPeriod"
+PROBE_TIMEOUT = 20     # 부하 때 seller TTFB 10.8s 관측 — 8s 는 너무 짧았다
+
+KEEP_INTERVAL = 30 * 60   # 자동 유지 주기(s) — 세션 60분의 절반
+KEEP_GAP = 5.0            # 새로고침 **완료 후** 연장까지 두는 간격(s)
+KEEP_RETRY = 60           # 발사/팝업 때문에 걸렀을 때 재시도(s)
+PREFLIGHT_EVERY = 3.0     # 발사 전 점검 주기(s) — 드라이버 1왕복이 든다
+CLOCK_STALE = 600         # 시계 측정이 이보다 오래되면 경고(s)
 
 POPUP_MARKS = ("RandomChk", "popupSellerRandom")
 POPUP_INPUT = "randeomChk"
 POPUP_POLL = 0.03      # 팝업 감시 간격(s) — 감지 지연의 상한
 POPUP_WATCH = 10.0     # 발사 후 감시 시간(s)
 FORM_POLL = 0.01       # 신청서 폼 로드 확인 간격(s) — 정각진입 때 임계경로에 든다
-FORM_WAIT = 15.0       # 폼 로드 최대 대기(s)
+FORM_WAIT = 40.0       # 폼 로드 최대 대기(s) — 재시도까지 포함한 총 예산
+# 접수 몰릴 때 seller 페이지 TTFB 를 3.7~10.8s 로 관측했다. 15s 는 정상 응답조차
+# 못 기다리고 포기하는 값이다 — 포기하면 그 회차는 통째로 날아간다.
+ENTER_TRIES = 3        # 진입 재시도 횟수. **진입만** — 제출은 절대 재시도하지 않는다
+DEAD_CHECK = 0.3       # 페이지 사망 판정 주기(s). innerText 는 레이아웃을 강제해
+                       # 비싸다 — FORM_POLL(10ms)로 돌리면 임계경로를 갉아먹는다
+
+# 서버가 부하로 연결을 끊으면 크롬은 자체 오류 페이지를 띄운다. 그 위에서
+# goApply 를 기다려 봐야 영원히 안 온다. 한 왕복으로 상태만 분류한다.
+DEAD_JS = r"""
+if (typeof goApply === 'function') return 'ok';
+if (document.readyState !== 'complete') return 'loading';
+var t = ((document.body && document.body.innerText) || '').trim();
+if (/ERR_|작동하지 않습니다|연결할 수 없|시간이 너무 오래|Bad Gateway|Service Unavailable|Gateway Time-?out|HTTP Status (50|40)/i.test(t))
+  return 'dead';
+if (t.length < 80) return 'blank';
+return 'other';
+"""
 
 # 확인코드 팝업 처리 전체를 브라우저에서 1왕복으로 끝낸다.
 # URL 판정 → 코드 읽기 → 역순 입력 → (옵션)확인까지 한 번에.
@@ -73,22 +106,58 @@ STEPS = [
 ]
 
 
-def _probe(url):
-    
-    req = urllib.request.Request(
-        url, method="HEAD",
-        headers={"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"})
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            t1, d = time.time(), r.headers.get("Date")
-    except urllib.error.HTTPError as e:
-        t1, d = time.time(), e.headers.get("Date")
-    except Exception:
-        return None
-    if not d:
-        return None
-    return parsedate_to_datetime(d).timestamp(), t0, t1
+PROBE_HEADERS = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
+
+
+class _ClockProbe:
+    """서버 Date 를 읽는 HEAD 프로브. **연결을 유지한다.**
+
+    제약 하나의 폭이 1.0+RTT 초라 구간 폭은 결국 RTT 바닥에 수렴한다.
+    매번 새로 열면 TLS 핸드셰이크가 그 RTT 에 통째로 들어간다. 같은 25회 실측:
+      새 연결 매번   폭 416.0ms · 최소RTT 239.0ms
+      연결 유지      폭 150.6ms · 최소RTT  45.9ms
+    선착순에서 이 차이는 곧 순번이다.
+
+    (측정값, 실패사유) 를 돌려준다. 실패를 삼키면 SSL·타임아웃·차단이 전부
+    '재측정 실패'로 뭉개져 원인을 못 찾는다.
+    """
+
+    def __init__(self, url):
+        u = urllib.parse.urlsplit(url)
+        self.host, self.port = u.hostname, u.port or 443
+        self.path = u.path or "/"
+        self.c = None
+
+    def close(self):
+        try:
+            if self.c:
+                self.c.close()
+        except Exception:
+            pass
+        self.c = None
+
+    def __call__(self):
+        # 유휴 연결은 서버가 끊는다(측정 주기 180s). 한 번은 다시 열고 재시도한다.
+        last = None
+        for _ in range(2):
+            try:
+                if self.c is None:
+                    self.c = http.client.HTTPSConnection(
+                        self.host, self.port, timeout=PROBE_TIMEOUT,
+                        context=ssl.create_default_context())
+                t0 = time.time()
+                self.c.request("HEAD", self.path, headers=PROBE_HEADERS)
+                r = self.c.getresponse()
+                t1 = time.time()
+                d = r.getheader("Date")
+                r.read()                      # 다음 요청을 위해 반드시 비운다
+                if not d:
+                    return None, "Date 헤더 없음"
+                return (parsedate_to_datetime(d).timestamp(), t0, t1), None
+            except Exception as e:
+                last = "%s: %s" % (type(e).__name__, e)
+                self.close()
+        return None, last
 
 
 class ServerClock(threading.Thread):
@@ -107,6 +176,7 @@ class ServerClock(threading.Thread):
         self.mode = "safe"
         self.jumped = False
         self._kick = threading.Event()
+        self.probe = _ClockProbe(CLOCK_URL)   # 연결 유지 — 측정 스레드 전용
 
     def remeasure_now(self):
         self._kick.set()
@@ -119,9 +189,12 @@ class ServerClock(threading.Thread):
 
     def _measure(self, n=25):
         lo, hi, kept, best = -1e9, 1e9, 0, 9e9
+        errs = []
         for _ in range(n):
-            r = _probe(CLOCK_URL)
+            r, err = self.probe()
             if not r:
+                if err and err not in errs:
+                    errs.append(err)
                 time.sleep(0.2)
                 continue
             s, t0, t1 = r
@@ -134,6 +207,9 @@ class ServerClock(threading.Thread):
                 lo, hi, kept = a, b, 1
             time.sleep(0.11)
         if kept >= 3:
+            if errs:
+                self.q.put(("clock", "   (%d/%d 실패 — %s)"
+                            % (n - kept, n, " / ".join(errs[:2]))))
             prev = self.offset
             self.lo, self.hi = lo, hi
             self.offset, self.err = (lo + hi) / 2, (hi - lo) / 2
@@ -144,7 +220,9 @@ class ServerClock(threading.Thread):
                            "  ⚠ 이전 대비 %+.0fms 튐" % ((self.offset - prev) * 1000)
                            if self.jumped else "")))
         else:
-            self.q.put(("clock", "재측정 실패 — 네트워크 확인"))
+            self.q.put(("clock", "재측정 실패 (%d/%d) — %s"
+                        % (n - kept, n,
+                           " / ".join(errs[:2]) if errs else "원인 미상")))
 
     def _off(self):
         """모드별 offset. safe 는 구간 하한(=서버시각을 낮게 봐서 늦게 쏨)."""
@@ -476,11 +554,24 @@ class App(tk.Tk):
         self.watch = None
         self.popup_mode = ["fill"]        # 팝업 정지 지점 — 작업 스레드가 읽는다
         self.entry_mode = ["at_target"]   # 정각에 무엇을 누를지 — 작업 스레드가 읽는다
+        self.keep_job = None              # 다음 주기 after() 핸들
+        self.keep_gap_job = None          # 새로고침 → 연장 사이 after() 핸들
         self._build()
         self.after(50, self._tick)
         self.after(200, self._pump)
+        self.after(300, self._banner_tick)
+        self.after(1000, self._preflight)
 
     def _build(self):
+        # 최상단 상태 배너 — "지금 발사하면 어디까지 가나"를 한 줄로 못박는다.
+        # 무장 여부와 팝업 모드를 곱해야 나오는 값이라 둘을 따로 보면 놓친다.
+        self.v_banner = tk.StringVar(value="")
+        self.lbl_banner = tk.Label(self, textvariable=self.v_banner,
+                                   font=("맑은 고딕", 13, "bold"),
+                                   fg="white", bg="#666", pady=7)
+        self.lbl_banner.pack(fill="x", side="top")
+        self._blink = False
+
         f1 = ttk.LabelFrame(self, text="  ev.or.kr 서버시계 (포트 %d 세션과 같은 서버)  " % PORT)
         f1.pack(fill="x", padx=10, pady=(10, 6))
         self.v_srv = tk.StringVar(value="--:--:--.---")
@@ -507,6 +598,12 @@ class App(tk.Tk):
                   justify="center").pack(side="left")
         ttk.Button(r, text="시계 재측정",
                    command=self.clock.remeasure_now).pack(side="left", padx=8)
+
+        # 입력한 문자열이 실제 몇 시로 환산됐는지 그대로 되비춘다.
+        self.v_tdesc = tk.StringVar(value="")
+        self.lbl_tdesc = tk.Label(f1, textvariable=self.v_tdesc,
+                                  font=("Consolas", 9))
+        self.lbl_tdesc.pack(pady=(0, 2))
 
         r1b = ttk.Frame(f1)
         r1b.pack(pady=(0, 2))
@@ -535,6 +632,14 @@ class App(tk.Tk):
         ttk.Label(r2, textvariable=self.v_sess).pack(side="left", padx=10)
         ttk.Button(r2, text="세션 연장",
                    command=self.extend).pack(side="left")
+        self.v_keep = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r2, text="%d분마다 자동 (새로고침 → %.0fs → 연장)"
+                        % (KEEP_INTERVAL // 60, KEEP_GAP),
+                        variable=self.v_keep,
+                        command=self._apply_keep).pack(side="left", padx=12)
+        self.v_keepnext = tk.StringVar(value="")
+        ttk.Label(r2, textvariable=self.v_keepnext,
+                  foreground="#080").pack(side="left")
         self.v_url = tk.StringVar(value="")
         ttk.Label(f2, textvariable=self.v_url, foreground="#666").pack(anchor="w", padx=6)
 
@@ -597,6 +702,11 @@ class App(tk.Tk):
         self.lbl_pmode.pack(anchor="w", padx=8, pady=(0, 4))
         self._apply_popup_mode(quiet=True)
 
+        self.v_pf = tk.StringVar(value="점검 대기…")
+        self.lbl_pf = tk.Label(f3, textvariable=self.v_pf, font=("Consolas", 9),
+                               justify="left", anchor="w")
+        self.lbl_pf.pack(fill="x", padx=8, pady=(0, 6))
+
         self.log = tk.Text(self, height=9, wrap="word", font=("Consolas", 9))
         self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.log.tag_config("red", foreground="#c00")
@@ -627,6 +737,17 @@ class App(tk.Tk):
 
     def _apply_popup_mode(self, quiet=False):
         m = self.v_popup.get()
+        # 무장한 채로 auto 로 올리는 건 조용히 넘어가면 안 되는 승급이다.
+        # 배너는 바뀌지만 라디오만 보고 있으면 못 본다.
+        if not quiet and m == "auto" and self.armed:
+            if not messagebox.askyesno(
+                    "자동 확인 승급",
+                    "이미 무장된 상태다.\n\n"
+                    "auto 로 바꾸면 정각에 제출한 뒤 goCompare 까지 자동으로 눌러\n"
+                    "사람 개입 없이 접수가 확정된다.\n\n"
+                    "정말 바꿀까?", icon="warning"):
+                self.v_popup.set(self.popup_mode[0])
+                return
         self.popup_mode[0] = m
         desc, color = self.POPUP_DESC[m]
         self.v_pmode.set(desc)
@@ -671,6 +792,7 @@ class App(tk.Tk):
             if t:
                 self.v_cd.set("목표까지  %s" % self._fmt_delta(t - n))
             self._update_risk()
+        self._update_target_desc()
         self.after(50, self._tick)
 
     def _apply_mode(self):
@@ -693,6 +815,113 @@ class App(tk.Tk):
                             % (-m * 1000))
             self.lbl_risk.config(fg="#c00")
 
+    # ── 상태 배너 ───────────────────────────────────────────────
+    # 위험도는 (무장 여부 × 팝업 모드) 곱이다. 라디오 하나만 보고 있으면
+    # "무장은 했는데 auto 인 줄 몰랐다"가 나온다. 그래서 곱해서 한 줄로 박는다.
+
+    def _banner_tick(self):
+        auto = self.popup_mode[0] == "auto"
+        if not self.armed:
+            txt = "🟢 안전 — 무장 해제됨. [예약 발사] 잠김. 리허설만 나간다."
+            bg = "#4a7a5a"
+        elif auto:
+            self._blink = not self._blink
+            txt = ("🔴 실발사 + 자동 확인 — 정각에 제출하고 goCompare 까지 눌러 "
+                   "접수가 확정된다. 사람이 멈출 지점이 없다.")
+            bg = "#cc0000" if self._blink else "#7a0000"
+        else:
+            stop = "감지만 한다" if self.popup_mode[0] == "watch" else "역순 입력 후 멈춘다"
+            txt = ("🟠 실발사 무장됨 — 정각에 제출한다. 확인코드 팝업은 %s. "
+                   "[확인]을 눌러야 저장된다." % stop)
+            bg = "#c47f17"
+
+        if self.armed:
+            t, n = self._target_epoch(), self.clock.now()
+            if t and n:
+                txt += "   목표까지 %s" % self._fmt_delta(t - n)
+        self.v_banner.set(txt)
+        self.lbl_banner.config(bg=bg)
+        self.after(500, self._banner_tick)
+
+    # ── 발사 전 검증 루프 ───────────────────────────────────────
+
+    @staticmethod
+    def _sess_secs(s):
+        """'54:47' → 3287. 못 읽으면 None."""
+        m = re.match(r"^\s*(\d+):(\d{2})\s*$", s or "")
+        return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+    def _preflight(self):
+        # 재예약을 먼저 건다 — 아래에서 뭐가 터져도 루프는 살아 있어야 한다.
+        self.after(int(PREFLIGHT_EVERY * 1000), self._preflight)
+
+        # 발사 시퀀스 중엔 드라이버를 절대 건드리지 않는다. 점검 왕복 하나가
+        # 정각 임계경로에 끼는 것보다 점검을 쉬는 편이 낫다.
+        if self.fire_thread and self.fire_thread.is_alive():
+            self.v_pf.set("점검 중지 — 발사 시퀀스 진행 중")
+            self.lbl_pf.config(fg="#555")
+            return
+
+        marks, bad, warn = [], 0, 0
+
+        def add(ok, good, why):
+            nonlocal bad, warn
+            if ok is True:
+                marks.append("✔" + good)
+            elif ok is None:
+                marks.append("△" + why)
+                warn += 1
+            else:
+                marks.append("✖" + why)
+                bad += 1
+
+        add(self.d is not None, "연결", "연결없음")
+
+        if self.d is None:
+            add(False, "", "리스트?")
+        else:
+            try:
+                fn = self.d.execute_script("return typeof app_accept")
+                add(fn == "function", "리스트", "리스트아님")
+            except Exception:
+                add(False, "", "드라이버死")
+
+        c = self.clock
+        if c.offset is None:
+            add(False, "", "시계미측정")
+        else:
+            age = time.time() - (c.at or 0)
+            width = (c.hi - c.lo) * 1000
+            add(None if age > CLOCK_STALE else True,
+                "시계(%ds전·폭%.0fms)" % (age, width),
+                "시계낡음(%dm전)" % (age // 60))
+
+        seq = self.v_seq.get().strip()
+        rows = (self.info or {}).get("rows", [])
+        if not seq:
+            add(False, "", "대상없음")
+        elif rows and not any(r["seq"] == seq for r in rows):
+            add(None, "", "대상 %s 목록에없음" % seq)
+        else:
+            add(True, "대상 %s" % seq, "")
+
+        t, n = self._target_epoch(), c.now()
+        if t is None or n is None:
+            add(False, "", "목표형식")
+        else:
+            left = t - n
+            add(left > 0, "목표 T-%s" % self._fmt_delta(left), "목표지남")
+            sl = self._sess_secs((self.info or {}).get("session"))
+            if sl is None:
+                add(None, "", "세션?")
+            else:
+                add(None if sl < left else True,
+                    "세션 %dm" % (sl // 60),
+                    "세션 %dm < 목표까지 %dm" % (sl // 60, left // 60))
+
+        self.v_pf.set("점검  " + "  ".join(marks))
+        self.lbl_pf.config(fg="#c00" if bad else ("#c47f17" if warn else "#080"))
+
     @staticmethod
     def _fmt_delta(s):
         sign = "-" if s < 0 else ""
@@ -709,10 +938,22 @@ class App(tk.Tk):
         'YYYY-MM-DD HH:MM[:SS]' → 그 날짜 그대로.
         'HH:MM[:SS]'            → 오늘 기준, 이미 지났으면 내일.
         """
+        r = self._resolve_target()
+        return r["epoch"] if r["ok"] else None
+
+    WEEKDAY = "월화수목금토일"
+
+    def _resolve_target(self):
+        """목표 입력을 실제 서버시각으로 환산하고 **어떻게 읽었는지**까지 돌려준다.
+
+        날짜 없는 'HH:MM' 은 이미 지났으면 내일로 넘어간다 — 이게 조용히 일어나면
+        오늘 10시에 쏠 생각이었는데 내일로 잡히는 사고가 난다. rolled 로 드러낸다.
+        """
         s = self.v_target.get().strip()
         n = self.clock.now()
         if n is None:
-            return None
+            return {"ok": False, "epoch": None, "src": s,
+                    "why": "시계 미측정 — 목표를 환산할 기준이 없다"}
         now_dt = datetime.fromtimestamp(n, KST)
         for fmt, dated in (("%Y-%m-%d %H:%M:%S", True), ("%Y-%m-%d %H:%M", True),
                            ("%H:%M:%S", False), ("%H:%M", False)):
@@ -721,11 +962,47 @@ class App(tk.Tk):
             except ValueError:
                 continue
             if dated:
-                return t.replace(tzinfo=KST).timestamp()
-            e = now_dt.replace(hour=t.hour, minute=t.minute,
-                               second=t.second, microsecond=0).timestamp()
-            return e + 86400 if e < n else e
-        return None
+                dt = t.replace(tzinfo=KST)
+                rolled = False
+            else:
+                dt = now_dt.replace(hour=t.hour, minute=t.minute,
+                                    second=t.second, microsecond=0)
+                rolled = dt.timestamp() < n
+                if rolled:
+                    dt += timedelta(days=1)
+            return {"ok": True, "epoch": dt.timestamp(), "dt": dt,
+                    "rolled": rolled, "fmt": fmt, "dated": dated, "src": s}
+        return {"ok": False, "epoch": None, "src": s,
+                "why": "형식을 못 읽는다 — HH:MM · HH:MM:SS · YYYY-MM-DD HH:MM[:SS]"}
+
+    def _update_target_desc(self):
+        r = self._resolve_target()
+        if not r["ok"]:
+            self.v_tdesc.set("목표 '%s' → ✖ %s" % (r["src"], r["why"]))
+            self.lbl_tdesc.config(fg="#c00")
+            return
+        dt, n = r["dt"], self.clock.now()
+        today = datetime.fromtimestamp(n, KST).date()
+        day = ("오늘" if dt.date() == today else
+               "내일" if (dt.date() - today).days == 1 else
+               "%+d일" % (dt.date() - today).days)
+        try:
+            lead = float(self.v_lead.get()) / 1000.0
+        except Exception:
+            lead = 0.05
+        fire = dt - timedelta(seconds=lead)
+        txt = ("목표 '%s' → %s(%s) %s %s KST   ·   남은 %s   ·   "
+               "리드 %.0fms 빼면 실제 발사 %s"
+               % (r["src"], day, self.WEEKDAY[dt.weekday()],
+                  dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S.%f")[:-3],
+                  self._fmt_delta(r["epoch"] - n), lead * 1000,
+                  fire.strftime("%H:%M:%S.%f")[:-3]))
+        if r["rolled"]:
+            txt = "⚠ 오늘 %s 은 이미 지났다 → 내일로 넘어갔다.  " % r["src"] + txt
+            self.lbl_tdesc.config(fg="#c00")
+        else:
+            self.lbl_tdesc.config(fg="#080" if r["epoch"] > n else "#c00")
+        self.v_tdesc.set(txt)
 
     def open_periods(self):
         if self.d is None:
@@ -774,11 +1051,84 @@ class App(tk.Tk):
         self._log("현황 갱신: %d행, 세션 %s" % (len(self.info["rows"]), self.info["session"]))
 
     def extend(self):
+        if self.d is None:
+            self._log("세션 연장 실패: 크롬에 연결돼 있지 않다", "red")
+            return
         try:
             self.d.execute_script("getSessionCheck();")
             self._log("세션 연장 요청")
         except Exception as e:
             self._log("세션 연장 실패: %r" % e, "red")
+
+    # ── 자동 유지 ───────────────────────────────────────────────
+    # 새로고침은 탭을 전환하고(ev_tab) 버튼·행마다 드라이버를 왕복해서
+    # 목록이 길수록 오래 걸린다. 그래서 연장은 refresh() 가 **반환한 뒤**
+    # KEEP_GAP 초를 세고 쏜다 — 걸린 시간과 무관하게 간격이 보장된다.
+    # 대기는 전부 after() 다. time.sleep 을 쓰면 시계 표시가 멈춘다.
+
+    def _apply_keep(self):
+        if self.v_keep.get():
+            self._log("자동 유지 켬 — %d분마다 새로고침 → %.0fs 후 연장"
+                      % (KEEP_INTERVAL // 60, KEEP_GAP))
+            self._keep_schedule(KEEP_INTERVAL)
+        else:
+            self._keep_cancel()
+            self.v_keepnext.set("")
+            self._log("자동 유지 끔")
+
+    def _keep_cancel(self):
+        for job in (self.keep_job, self.keep_gap_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self.keep_job = self.keep_gap_job = None
+
+    def _keep_schedule(self, secs):
+        if self.keep_job:
+            try:
+                self.after_cancel(self.keep_job)
+            except Exception:
+                pass
+        self.keep_job = self.after(int(secs * 1000), self._keep_run)
+        nxt = datetime.now(KST) + timedelta(seconds=secs)
+        self.v_keepnext.set("· 다음 %s" % nxt.strftime("%H:%M:%S"))
+
+    def _keep_run(self):
+        self.keep_job = None
+        if not self.v_keep.get():
+            return
+        # 발사 대기 중엔 절대 건드리지 않는다. refresh() 는 탭을 전환하고
+        # PopupWatch 를 새로 만든다 — 정각 임계경로에 끼면 발사가 통째로 어긋난다.
+        if self.fire_thread and self.fire_thread.is_alive():
+            self._log("자동 유지 건너뜀 — 발사 대기 중. %ds 후 다시 본다" % KEEP_RETRY)
+            self._keep_schedule(KEEP_RETRY)
+            return
+        if self.watch and self.watch.alive():
+            self._log("자동 유지 건너뜀 — 확인코드 팝업이 열려 있다. %ds 후 다시 본다"
+                      % KEEP_RETRY)
+            self._keep_schedule(KEEP_RETRY)
+            return
+
+        t0 = time.time()
+        self.refresh()
+        self._log("자동: 새로고침 %.1fs 소요 → %.0fs 후 연장"
+                  % (time.time() - t0, KEEP_GAP))
+        if self.keep_gap_job:
+            try:
+                self.after_cancel(self.keep_gap_job)
+            except Exception:
+                pass
+        self.keep_gap_job = self.after(int(KEEP_GAP * 1000), self._keep_extend)
+        self._keep_schedule(KEEP_INTERVAL)
+
+    def _keep_extend(self):
+        self.keep_gap_job = None
+        if not self.v_keep.get():
+            return
+        self._log("자동: 세션 연장")
+        self.extend()
 
     def pick(self):
         sel = self.tree.selection()
@@ -800,13 +1150,21 @@ class App(tk.Tk):
             return
         row = next((r for r in (self.info or {}).get("rows", []) if r["seq"] == seq), None)
         desc = row["desc"] if row else "(목록에 없음 — 직접 입력한 번호)"
+        auto = self.popup_mode[0] == "auto"
         if not messagebox.askyesno(
                 "무장 확인",
                 "아래 신청건을 실제로 제출한다.\n\n"
                 "신청번호 : %s\n%s\n\n"
-                "목표(서버) %s · 리드 %sms\n\n"
+                "목표(서버) %s · 리드 %sms\n"
+                "확인코드 팝업 : %s\n\n"
+                "%s\n\n"
                 "되돌리려면 사이트에서 취소해야 한다. 무장할까?"
-                % (seq, desc, self.v_target.get(), self.v_lead.get())):
+                % (seq, desc, self.v_target.get(), self.v_lead.get(),
+                   {"watch": "감지만", "fill": "역순 입력 후 정지",
+                    "auto": "⚠ goCompare 까지 실행"}[self.popup_mode[0]],
+                   "⚠⚠ 자동 확인이 켜져 있다 — 사람 개입 없이 접수가 확정된다."
+                   if auto else "확인코드 팝업의 [확인]은 네가 눌러야 저장된다."),
+                icon="warning" if auto else "question"):
             return
         self.armed = True
         self.btn_arm.config(text="⚠ 무장됨", bg="#f2c1c1")
@@ -887,29 +1245,99 @@ class App(tk.Tk):
         n = self.clock.now()
         return datetime.fromtimestamp(n, KST).strftime("%H:%M:%S.%f")[:-3] if n else "?"
 
+    def _back_to_list(self, budget):
+        """죽은 페이지에서 목록으로 복귀. app_accept 는 목록에만 정의돼 있어서
+        (EV_apply.md §3) 재진입하려면 반드시 여기를 먼저 밟아야 한다.
+
+        뒤로가기를 먼저 쓴다 — bfcache 를 타면 재요청보다 훨씬 싸고, 부하 중엔
+        그 차이가 크다. 실패하면 리스트를 새로 받는다.
+        """
+        try:
+            self.d.set_page_load_timeout(max(2.0, budget))
+        except Exception:
+            pass
+        try:
+            for how, act in (("뒤로가기", self.d.back),
+                             ("리스트 재요청", lambda: self.d.get(LIST_URL))):
+                try:
+                    act()
+                except Exception as e:
+                    self.q.put(("f", "   복귀(%s) 실패: %s" % (how, type(e).__name__)))
+                try:
+                    if self.d.execute_script("return typeof app_accept") == "function":
+                        self.q.put(("f", "   복귀 성공(%s)" % how))
+                        return True
+                except Exception:
+                    pass
+            return False
+        finally:
+            try:
+                self.d.set_page_load_timeout(300)
+            except Exception:
+                pass
+
     def _enter_form(self, seq, critical):
         """리스트에서 [지원신청조회] = app_accept 로 신청서 폼에 들어간다.
 
         critical=True 면 정각 임계경로 위다 — 폼 로드 확인을 FORM_POLL 로 조인다.
         (선진입일 땐 어차피 여유가 있으니 왕복을 아껴 느슨하게 본다.)
+
+        부하로 서버가 연결을 끊으면(ERR_EMPTY_RESPONSE 관측) 크롬 오류 페이지가
+        뜨는데, 예전엔 그 위에서 goApply 를 FORM_WAIT 내내 기다리다 그 회차를
+        통째로 날렸다. 이제 사망을 판정해 목록으로 되돌아가 다시 들어간다.
+        재시도는 **진입에만** 건다 — goApply 재시도는 중복 신청이 된다.
+
         반환: (성공?, 소요초)
         """
         t0 = time.time()
-        try:
-            self.d.execute_script("app_accept(arguments[0], arguments[1]);", seq, "100")
-        except Exception as e:
-            self.q.put(("f", "조회 진입 실패: %r" % e))
-            return False, time.time() - t0
+        end = t0 + FORM_WAIT
         step = FORM_POLL if critical else 0.1
-        end = time.time() + FORM_WAIT
-        while time.time() < end:
+
+        for attempt in range(1, ENTER_TRIES + 1):
+            if attempt > 1:
+                left = end - time.time()
+                if left <= 1.0:
+                    break
+                self.q.put(("f", "   진입 %d회차 — 목록으로 복귀 (남은 %.1fs)"
+                            % (attempt, left)))
+                if not self._back_to_list(left * 0.5):
+                    self.q.put(("f", "   목록 복귀 실패 — 화면을 직접 봐라"))
+                    break
+
             try:
-                if self.d.execute_script("return typeof goApply") == "function":
-                    return True, time.time() - t0
-            except Exception:
-                pass
-            time.sleep(step)
-        self.q.put(("f", "폼 로드 확인 실패 — 화면을 직접 봐라"))
+                self.d.execute_script(
+                    "app_accept(arguments[0], arguments[1]);", seq, "100")
+            except Exception as e:
+                self.q.put(("f", "조회 진입 실패(%d회차): %r" % (attempt, e)))
+                continue
+
+            next_dead = time.time() + DEAD_CHECK
+            while time.time() < end:
+                try:
+                    if self.d.execute_script("return typeof goApply") == "function":
+                        if attempt > 1:
+                            self.q.put(("f", "   %d회차에서 진입 성공" % attempt))
+                        return True, time.time() - t0
+                except Exception:
+                    pass                      # 페이지 교체 중이면 튄다 — 정상
+
+                now = time.time()
+                if now >= next_dead:
+                    next_dead = now + DEAD_CHECK
+                    try:
+                        st = self.d.execute_script(DEAD_JS)
+                    except Exception:
+                        st = None
+                    if st in ("dead", "blank"):
+                        self.q.put(("f", "   ⚠ 페이지가 죽었다(%s) — %.1fs 만에 감지"
+                                    % (st, now - t0)))
+                        break                 # 바깥 for 로 → 복귀 후 재진입
+                time.sleep(step)
+            else:
+                break                         # 시간 예산 소진
+
+        self.q.put(("f", "폼 로드 확인 실패 (%.1fs, %d회 시도) — 화면을 직접 봐라"
+                    % (time.time() - t0, attempt)))
         return False, time.time() - t0
 
     def _fire_worker(self, seq, target_srv, lead, real, pre):
