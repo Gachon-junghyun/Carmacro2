@@ -35,15 +35,69 @@ KEEP_RETRY = 60           # 발사/팝업 때문에 걸렀을 때 재시도(s)
 PREFLIGHT_EVERY = 3.0     # 발사 전 점검 주기(s) — 드라이버 1왕복이 든다
 CLOCK_STALE = 600         # 시계 측정이 이보다 오래되면 경고(s)
 
+# 목록의 단계 탭은 btnSearch('<코드들>', ...) 로 갈린다. 실측(2026-08-20):
+#     제출전(1건)        btnSearch('100', 'ALL')
+#     지원신청(1건)       btnSearch('101,102,103', 'N')
+#     보완요청(승인전)     btnSearch('110', 'N')
+# 그리고 행 버튼은 app_accept('<신청번호>', '<app_step>', '') 이다.
+# 즉 행이 자기 단계 코드를 들고 있다 — 라벨("제출전")로 탭을 찾으면 그 행이
+# 다른 단계에 있을 때 영영 못 찾는다. 코드로 찾는 게 맞다.
+STAGE_MARK = "제출전"   # 코드 매칭이 실패했을 때만 쓰는 라벨 폴백
+
+# 대상 행이 보이는지 확인하고, 없으면 그 행의 단계 탭을 눌러 준다. 한 왕복.
+# 반환: 'row' / 'clicked:<라벨>' / 'nostage' / 'nolist'
+STAGE_JS = r"""
+var seq = arguments[0], step = arguments[1], mark = arguments[2];
+if (typeof app_accept !== 'function') return 'nolist';
+var acc = document.querySelectorAll("[onclick*='app_accept']");
+for (var i = 0; i < acc.length; i++) {
+  if ((acc[i].getAttribute('onclick') || '').indexOf("'" + seq + "'") >= 0) return 'row';
+}
+var tabs = document.querySelectorAll("[onclick*='btnSearch']");
+// 1순위: 단계 코드가 그 탭의 코드 목록에 든 버튼
+for (var j = 0; j < tabs.length; j++) {
+  var oc = tabs[j].getAttribute('onclick') || '';
+  var m = oc.match(/btnSearch\('([^']*)'/);
+  if (!m) continue;
+  var codes = m[1].split(',');
+  for (var k = 0; k < codes.length; k++) {
+    if (codes[k].replace(/\s/g, '') === step) {
+      tabs[j].click();
+      return 'clicked:' + (tabs[j].textContent || '').replace(/\s+/g, '');
+    }
+  }
+}
+// 2순위: 라벨 폴백
+for (var n = 0; n < tabs.length; n++) {
+  if ((tabs[n].textContent || '').replace(/\s+/g, '').indexOf(mark) === 0) {
+    tabs[n].click();
+    return 'clicked:' + (tabs[n].textContent || '').replace(/\s+/g, '');
+  }
+}
+return 'nostage';
+"""
+
 POPUP_MARKS = ("RandomChk", "popupSellerRandom")
 POPUP_INPUT = "randeomChk"
 POPUP_POLL = 0.03      # 팝업 감시 간격(s) — 감지 지연의 상한
 POPUP_WATCH = 10.0     # 발사 후 감시 시간(s)
 FORM_POLL = 0.01       # 신청서 폼 로드 확인 간격(s) — 정각진입 때 임계경로에 든다
-FORM_WAIT = 40.0       # 폼 로드 최대 대기(s) — 재시도까지 포함한 총 예산
-# 접수 몰릴 때 seller 페이지 TTFB 를 3.7~10.8s 로 관측했다. 15s 는 정상 응답조차
-# 못 기다리고 포기하는 값이다 — 포기하면 그 회차는 통째로 날아간다.
-ENTER_TRIES = 3        # 진입 재시도 횟수. **진입만** — 제출은 절대 재시도하지 않는다
+FORM_RELAX = 10.0      # 이 시간이 지나면 폴링을 0.1s 로 늦춘다. 정각 직후엔 10ms
+                       # 정밀도가 의미 있지만, 몇 분째 서버가 안 받는 상황에서
+                       # 10ms 로 계속 두드리면 드라이버가 먼저 지친다.
+# 접수 몰릴 때 서버가 아예 연결을 끊는다(ERR_EMPTY_RESPONSE). 14분 넘게 그 상태인
+# 걸 실제로 겪었다 — 40s 예산은 그 회차를 통째로 버리는 값이었다. 우회로는 없고
+# 서버가 숨 쉬는 순간에 걸리는 수밖에 없으니, 지치지 않고 계속 두드리는 게 전부다.
+FORM_WAIT = 1800.0     # 폼 로드 최대 대기(s) = 총 재시도 예산. 30분.
+                       # 주의: 이 동안 자동 세션연장이 멈춘다(_keep_run 이 발사
+                       # 스레드를 보고 건너뛴다). 사이트 세션이 60분이니 이미
+                       # 오래 열어둔 창이면 재시도 도중 세션이 먼저 죽을 수 있다.
+ENTER_TRIES = 2000     # 진입 재시도 횟수. **진입만** — 제출은 절대 재시도하지 않는다.
+                       # 사실상 무제한이고 진짜 상한은 FORM_WAIT 다.
+RETRY_GAP = 0.5        # 회차 사이 간격(s). 끊고 있는 서버를 더 빨리 두드려도
+                       # 돌아오는 건 같다 — 예산만 태운다.
+BACK_BUDGET = 15.0     # 목록 복귀 한 번에 줄 최대 시간(s). 예산 비율로 주면
+                       # 900s 예산에서 한 번의 멈춤이 450s 를 삼킨다.
 DEAD_CHECK = 0.3       # 페이지 사망 판정 주기(s). innerText 는 레이아웃을 강제해
                        # 비싸다 — FORM_POLL(10ms)로 돌리면 임계경로를 갉아먹는다
 
@@ -1317,9 +1371,25 @@ class App(tk.Tk):
         if self.entry_mode[0] == "pre_enter" and t - n < pre:
             pre = max(2.0, t - n - 1.0)
             self._log("목표가 가까워 선진입을 T-%.0fs 로 당겼다" % pre)
+        step = self._step_for(seq)
         self.fire_thread = threading.Thread(
-            target=self._fire_worker, args=(seq, t, lead, real, pre), daemon=True)
+            target=self._fire_worker, args=(seq, step, t, lead, real, pre), daemon=True)
         self.fire_thread.start()
+
+    def _step_for(self, seq):
+        """목록 버튼이 실제로 넘기던 app_accept 두 번째 인자.
+
+        read_page() 가 onclick 에서 뽑아 rows 에 넣어둔 값이다. 예전엔 이걸
+        버리고 '100' 을 하드코딩했는데, 행마다 값이 다르면 버튼과 다른 단계로
+        들어간다 — 버튼을 눌렀을 때와 결과가 갈리는 지점이었다.
+        """
+        for r in (self.info or {}).get("rows", []):
+            if r["seq"] == seq:
+                if r.get("step") and r["step"] != "100":
+                    self._log("app_accept 2번째 인자 %s (목록 버튼에서 읽음)" % r["step"])
+                return r.get("step") or "100"
+        self._log("목록에 %s 가 없다 — app_accept 인자를 100 으로 가정한다" % seq, "red")
+        return "100"
 
     def _wait_until(self, server_epoch):
         """서버시각 server_epoch 까지 대기. 마지막 1초는 5ms 간격으로 조인다."""
@@ -1364,7 +1434,41 @@ class App(tk.Tk):
         n = self.clock.now()
         return datetime.fromtimestamp(n, KST).strftime("%H:%M:%S.%f")[:-3] if n else "?"
 
-    def _back_to_list(self, budget):
+    def _ensure_stage(self, seq, step, budget):
+        """대상 행의 단계 탭을 띄워 그 행이 실제로 렌더되게 한다.
+
+        app_accept 가 정의돼 있다고 목록이 준비된 게 아니다 — 새로 받은 목록은
+        기본 탭이라 대상 행이 없다. 사람이 손으로 단계 탭을 눌러 확인하고
+        들어가던 그 단계를 재시도에서도 똑같이 밟는다.
+
+        어느 탭인지는 행이 들고 있는 app_step 으로 정한다. 라벨로 찾으면
+        그 행이 '제출전'이 아닌 단계(예: 지원신청 101)에 있을 때 못 찾는다.
+        """
+        end = time.time() + max(2.0, budget)
+        tab = None
+        while time.time() < end:
+            try:
+                st = self.d.execute_script(STAGE_JS, seq, step, STAGE_MARK)
+            except Exception:
+                time.sleep(0.1)
+                continue
+            if st == "row":
+                if tab:
+                    self.q.put(("f", "   [%s] 눌러 대상 행 %s 확인" % (tab, seq)))
+                return True
+            if isinstance(st, str) and st.startswith("clicked:"):
+                tab = st.split(":", 1)[1]      # 조회가 돌아올 때까지 기다린다
+            elif st == "nostage":
+                self.q.put(("f", "   ⚠ 단계 %s 탭을 못 찾았다" % step))
+                return False
+            elif st == "nolist":
+                return False
+            time.sleep(0.1)
+        self.q.put(("f", "   ⚠ 대상 행 %s (단계 %s) 이 목록에 안 뜬다 (%.0fs)"
+                    % (seq, step, budget)))
+        return False
+
+    def _back_to_list(self, seq, step, budget):
         """죽은 페이지에서 목록으로 복귀. app_accept 는 목록에만 정의돼 있어서
         (EV_apply.md §3) 재진입하려면 반드시 여기를 먼저 밟아야 한다.
 
@@ -1383,11 +1487,14 @@ class App(tk.Tk):
                 except Exception as e:
                     self.q.put(("f", "   복귀(%s) 실패: %s" % (how, type(e).__name__)))
                 try:
-                    if self.d.execute_script("return typeof app_accept") == "function":
-                        self.q.put(("f", "   복귀 성공(%s)" % how))
-                        return True
+                    if self.d.execute_script("return typeof app_accept") != "function":
+                        continue
                 except Exception:
-                    pass
+                    continue
+                # 목록에 선 것만으로는 부족하다 — 대상 행이 보여야 진짜 복귀다.
+                if self._ensure_stage(seq, step, max(2.0, budget * 0.5)):
+                    self.q.put(("f", "   복귀 성공(%s)" % how))
+                    return True
             return False
         finally:
             try:
@@ -1395,7 +1502,7 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def _enter_form(self, seq, critical):
+    def _enter_form(self, seq, step, critical):
         """리스트에서 [지원신청조회] = app_accept 로 신청서 폼에 들어간다.
 
         critical=True 면 정각 임계경로 위다 — 폼 로드 확인을 FORM_POLL 로 조인다.
@@ -1417,15 +1524,16 @@ class App(tk.Tk):
                 left = end - time.time()
                 if left <= 1.0:
                     break
-                self.q.put(("f", "   진입 %d회차 — 목록으로 복귀 (남은 %.1fs)"
+                self.q.put(("f", "   진입 %d회차 — 목록으로 복귀 (남은 %.0fs)"
                             % (attempt, left)))
-                if not self._back_to_list(left * 0.5):
+                time.sleep(RETRY_GAP)
+                if not self._back_to_list(seq, step, min(BACK_BUDGET, left * 0.5)):
                     self.q.put(("f", "   목록 복귀 실패 — 화면을 직접 봐라"))
                     break
 
             try:
                 self.d.execute_script(
-                    "app_accept(arguments[0], arguments[1]);", seq, "100")
+                    "app_accept(arguments[0], arguments[1]);", seq, step)
             except Exception as e:
                 self.q.put(("f", "조회 진입 실패(%d회차): %r" % (attempt, e)))
                 continue
@@ -1451,6 +1559,8 @@ class App(tk.Tk):
                         self.q.put(("f", "   ⚠ 페이지가 죽었다(%s) — %.1fs 만에 감지"
                                     % (st, now - t0)))
                         break                 # 바깥 for 로 → 복귀 후 재진입
+                if step < 0.1 and now - t0 > FORM_RELAX:
+                    step = 0.1
                 time.sleep(step)
             else:
                 break                         # 시간 예산 소진
@@ -1459,7 +1569,7 @@ class App(tk.Tk):
                     % (time.time() - t0, attempt)))
         return False, time.time() - t0
 
-    def _fire_worker(self, seq, target_srv, lead, real, pre):
+    def _fire_worker(self, seq, step, target_srv, lead, real, pre):
         """발사. 정각에 무엇을 누르느냐가 entry_mode 로 갈린다.
 
         at_target : 정각에 **리스트에서 진입**(app_accept) → 폼 뜨자마자 지원신청.
@@ -1470,19 +1580,24 @@ class App(tk.Tk):
         """
         mode = "실발사" if real else "리허설"
         at_target = self.entry_mode[0] == "at_target"
-        self.q.put(("f", "%s 대기 — 신청번호 %s · %s · 리드 %.0fms"
-                    % (mode, seq,
+        self.q.put(("f", "%s 대기 — 신청번호 %s · app_accept(%s,%s) · %s · 리드 %.0fms"
+                    % (mode, seq, seq, step,
                        "정각에 리스트에서 진입" if at_target else "선진입 T-%.0fs" % pre,
                        lead * 1000)))
 
         if at_target:
-            # 정각 전에 리스트 페이지에 서 있는지만 확인해 둔다(진입 자체는 정각에).
+            # 정각 전에 리스트 페이지에 서 있는지 확인해 둔다(진입 자체는 정각에).
+            # T 이전이라 왕복이 공짜다 — 대상 행이 실제로 보이는지까지 본다.
             try:
                 ready = self.d.execute_script("return typeof app_accept") == "function"
             except Exception:
                 ready = False
             if not ready:
                 self.q.put(("f", "⚠ 리스트 페이지가 아니다 — [크롬 연결/새로고침] 후 다시 무장해라"))
+                return
+            if not self._ensure_stage(seq, step, 10.0):
+                self.q.put(("f", "⚠ 목록에 %s(단계 %s) 행이 안 보인다 — "
+                                 "해당 단계 탭을 눌러 확인해라" % (seq, step)))
                 return
             self.q.put(("f", "리스트 대기 중 · 서버 %s · 진입까지 %.1fs"
                         % (self._srv_str(), target_srv - self.clock.now())))
@@ -1492,14 +1607,14 @@ class App(tk.Tk):
                                  "실발사였다면 지금 app_accept 가 나갔다." % self._srv_str()))
                 return
             t_enter = self._srv_str()
-            ok, dt = self._enter_form(seq, critical=True)
+            ok, dt = self._enter_form(seq, step, critical=True)
             if not ok:
                 return
             self.q.put(("f", "▶ 정각 진입 — 지시 %s · 폼 준비 %s (%.0fms)"
                         % (t_enter, self._srv_str(), dt * 1000)))
         else:
             self._wait_until(target_srv - pre)
-            ok, dt = self._enter_form(seq, critical=False)
+            ok, dt = self._enter_form(seq, step, critical=False)
             if not ok:
                 return
             n = self.clock.now()
